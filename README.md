@@ -105,7 +105,10 @@ Note: Voice Browser always runs in headed mode (visible browser window).
 # Disable mini control UI:
 .\start.ps1 -NoMiniUi
 
-# Disable all spoken output (recommended if speakers cause echo):
+# Spoken output is OFF by default. Enable it only if you want responses:
+.\start.ps1 -EnableTts
+
+# Or explicitly disable spoken output:
 .\start.ps1 -NoTts
 
 # Disable barge-in (wait for TTS to finish before listening):
@@ -265,14 +268,14 @@ There are no rigid commands to memorize. The AI understands intent. Here are exa
 5. If you hear overlapping voices, close extra terminals; only one Voice Browser instance is allowed now.
 6. Use the mini UI "Set Mic" button to switch microphone without restarting.
 7. If it hears itself from speakers, leave echo guard enabled (default), lower speaker volume, or use headphones.
-8. To fully disable spoken responses, run with `.\start.ps1 -NoTts`.
+8. Spoken responses are disabled by default; enable only when needed with `.\start.ps1 -EnableTts`.
 9. For better latency/reliability, run local STT: `.\start.ps1 -SttBackend faster-whisper`.
 10. If GPU runtime libraries are missing, local STT now auto-falls back to CPU int8.
 11. If local STT has repeated backend errors, Voice Browser auto-switches to Google STT for that session.
 12. For long, slower thoughts, increase capture windows: `.\start.ps1 -PhraseLimit 40 -PauseThreshold 1.6`.
 13. To diagnose local STT failures, run with `-SttDebug`.
 
-## If TTS Is Not Audible
+## If TTS Is Enabled but Not Audible
 
 1. Run this quick test in PowerShell:
    ```powershell
@@ -295,7 +298,7 @@ Environment variables for customization:
 | `VOICE_BROWSER_LOCAL_STT_COMPUTE_TYPE` | `auto` | faster-whisper compute type (`auto`, `int8`, `float16`, etc.) |
 | `VOICE_BROWSER_STT_LANGUAGE` | `en` | Preferred STT language code |
 | `VOICE_BROWSER_STT_DEBUG` | `0` | Set to `1` to print detailed local STT exception traces |
-| `VOICE_BROWSER_TTS_ENABLED` | `1` | Set to `0` to disable spoken responses entirely |
+| `VOICE_BROWSER_TTS_ENABLED` | `0` | Set to `1` to enable spoken responses |
 | `VOICE_BROWSER_TTS_BACKEND` | `pyttsx3` | `windows`, `pyttsx3`, or `auto` |
 | `VOICE_BROWSER_TTS_RATE` | `180` | Speech rate (words per minute) |
 | `VOICE_BROWSER_SPEAK_STARTUP` | `0` | Set to `1` to speak startup status prompts |

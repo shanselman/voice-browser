@@ -14,6 +14,7 @@
 #   .\start.ps1 -Force
 #   .\start.ps1 -NoMiniUi
 #   .\start.ps1 -NoTts
+#   .\start.ps1 -EnableTts
 #   .\start.ps1 -DisableBargeIn
 #   .\start.ps1 -DisableEchoGuard
 #   .\start.ps1 -SttBackend faster-whisper -LocalSttModel base.en
@@ -31,6 +32,7 @@ param(
     [switch]$Force,
     [switch]$NoMiniUi,
     [switch]$NoTts,
+    [switch]$EnableTts,
     [switch]$DisableBargeIn,
     [switch]$DisableEchoGuard,
     [int]$MicrophoneIndex = -1,
@@ -104,8 +106,16 @@ if ($NoMiniUi) {
     $env:VOICE_BROWSER_MINI_UI = "0"
 }
 
+if (-not $EnableTts -and -not $NoTts) {
+    $env:VOICE_BROWSER_TTS_ENABLED = "0"
+}
+
 if ($NoTts) {
     $env:VOICE_BROWSER_TTS_ENABLED = "0"
+}
+
+if ($EnableTts) {
+    $env:VOICE_BROWSER_TTS_ENABLED = "1"
 }
 
 if ($DisableBargeIn) {

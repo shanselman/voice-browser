@@ -48,7 +48,7 @@ TTS_BACKEND = os.environ.get(
     "VOICE_BROWSER_TTS_BACKEND",
     "pyttsx3",
 ).strip().lower()
-TTS_ENABLED = os.environ.get("VOICE_BROWSER_TTS_ENABLED", "1").strip() != "0"
+TTS_ENABLED = os.environ.get("VOICE_BROWSER_TTS_ENABLED", "0").strip() != "0"
 STT_BACKEND = os.environ.get("VOICE_BROWSER_STT_BACKEND", "auto").strip().lower()
 STT_DEBUG = os.environ.get("VOICE_BROWSER_STT_DEBUG", "0").strip() == "1"
 LOCAL_STT_MODEL = os.environ.get("VOICE_BROWSER_LOCAL_STT_MODEL", "base.en").strip() or "base.en"
