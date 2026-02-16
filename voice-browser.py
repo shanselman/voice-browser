@@ -191,6 +191,7 @@ TARGET_STOP_WORDS = {
     "named",
     "text",
 }
+FOCUSED_TARGET = "@focused"
 
 
 @dataclass
@@ -213,6 +214,7 @@ class BrowserState:
     recent_history: List[Dict[str, str]] = field(default_factory=list)
     pending_confirmation: Optional[PlannerResult] = None
     snapshot_updated_at: float = 0.0
+    dictation_mode: bool = False
 
 
 class BrowserCommandError(RuntimeError):
@@ -748,10 +750,47 @@ class BrowserRuntime:
         return self._current_page
 
     def _target_selector(self, target: str) -> str:
+        if target.strip().lower() in {FOCUSED_TARGET, ":focus"}:
+            return ":focus"
         if target.startswith("@"):
             ref = target[1:]
             return f'[data-vb-ref="{ref}"]'
         return target
+
+    def _write_focused(self, page, text: str, replace: bool) -> bool:
+        return bool(
+            page.evaluate(
+                """([value, replace]) => {
+                    const el = document.activeElement;
+                    if (!el) return false;
+                    const tag = (el.tagName || '').toLowerCase();
+                    const type = (el.getAttribute('type') || '').toLowerCase();
+                    const textLikeInput = tag === 'textarea' || (tag === 'input' && ![
+                        'checkbox','radio','button','submit','reset','file','range','color','date',
+                        'datetime-local','month','time','week'
+                    ].includes(type));
+                    const commit = () => {
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    };
+                    if (textLikeInput) {
+                        const current = typeof el.value === 'string' ? el.value : '';
+                        el.value = replace ? value : (current + value);
+                        commit();
+                        return true;
+                    }
+                    const role = (el.getAttribute('role') || '').toLowerCase();
+                    if (el.isContentEditable || role === 'textbox') {
+                        const current = (el.textContent || '');
+                        el.textContent = replace ? value : (current + value);
+                        commit();
+                        return true;
+                    }
+                    return false;
+                }""",
+                [text, replace],
+            )
+        )
 
     def _readable_page_title(self, page) -> str:
         try:
@@ -1017,10 +1056,20 @@ class BrowserRuntime:
                     pass
                 raise RuntimeError(f"Could not find clickable item matching '{target}'.") from first_exc
         if command == "fill":
-            page.locator(self._target_selector(args[1])).first.fill(args[2], timeout=3500)
+            target = args[1]
+            if target.strip().lower() in {FOCUSED_TARGET, ":focus"}:
+                if not self._write_focused(page, args[2], replace=True):
+                    raise RuntimeError("No focused editable field. Click a textbox first, then try again.")
+                return "✓ Filled"
+            page.locator(self._target_selector(target)).first.fill(args[2], timeout=3500)
             return "✓ Filled"
         if command == "type":
-            page.locator(self._target_selector(args[1])).first.type(args[2], timeout=3500)
+            target = args[1]
+            if target.strip().lower() in {FOCUSED_TARGET, ":focus"}:
+                if not self._write_focused(page, args[2], replace=False):
+                    raise RuntimeError("No focused editable field. Click a textbox first, then try again.")
+                return "✓ Typed"
+            page.locator(self._target_selector(target)).first.type(args[2], timeout=3500)
             return "✓ Typed"
         if command == "press":
             page.keyboard.press(args[1])
@@ -1524,7 +1573,7 @@ def should_refresh_elements_for_utterance(user_text: str, state: BrowserState) -
     lowered = user_text.lower()
     if not state.elements:
         return True
-    if any(word in lowered for word in ("click", "press", "tap", "select", "fill", "type")):
+    if any(word in lowered for word in ("click", "press", "tap", "select", "fill", "type", "dictate", "textbox")):
         if time.time() - state.snapshot_updated_at > SNAPSHOT_STALE_SECONDS:
             return True
     return False
@@ -1558,6 +1607,7 @@ Rules:
 6) If action can close tab/browser, include confirmation_prompt.
 7) Prefer refs from context elements when clicking/filling.
 8) Use recent_history for follow-up requests like "click the first one" or "that button".
+9) For dictation/type intents on the currently focused textbox, use target "@focused".
 
 Allowed action types:
 open, back, forward, reload, click, fill, type_text, press, scroll,
@@ -1637,13 +1687,15 @@ def sanitize_action(raw_action: Any) -> Tuple[Optional[Dict[str, Any]], Optional
         if not url:
             return None, "Action 'open' requires url."
         clean["url"] = url
-    elif action_type in {"click", "fill", "type_text"}:
+    elif action_type == "click":
         target = str(raw_action.get("target", "")).strip()
         if not target:
-            return None, f"Action '{action_type}' requires target."
+            return None, "Action 'click' requires target."
         clean["target"] = target
-        if action_type in {"fill", "type_text"}:
-            clean["text"] = str(raw_action.get("text", ""))
+    elif action_type in {"fill", "type_text"}:
+        target = str(raw_action.get("target", "")).strip() or FOCUSED_TARGET
+        clean["target"] = target
+        clean["text"] = str(raw_action.get("text", ""))
     elif action_type == "press":
         key = str(raw_action.get("key", "")).strip()
         if not key:
@@ -1883,6 +1935,8 @@ def resolve_action_target(target: str, state: BrowserState) -> str:
     trimmed = target.strip()
     if not trimmed:
         return target
+    if trimmed.lower() in {FOCUSED_TARGET, ":focus"}:
+        return FOCUSED_TARGET
     if re.fullmatch(r"@?e\d+", trimmed.lower()):
         return f"@{trimmed.lstrip('@').lower()}"
     if looks_like_selector(trimmed):
@@ -1934,6 +1988,57 @@ def _extract_url_candidate(text: str) -> Optional[str]:
     if any(part in candidate.lower() for part in (" dot ", ".", " slash ", "/", "http", "www")):
         return candidate
     return None
+
+
+def is_dictation_start_command(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    patterns = (
+        r"\bstart dictation\b",
+        r"\bdictate into (?:this|the)?\s*(?:text ?box|textbox|field|input)\b",
+        r"\buse dictation\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def is_dictation_stop_command(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    patterns = (
+        r"\bstop dictation\b",
+        r"\bend dictation\b",
+        r"\bcancel dictation\b",
+        r"\bexit dictation\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def extract_inline_dictation_text(text: str) -> Optional[str]:
+    utterance = text.strip()
+    match = re.match(r"^dictate\s+(.+)$", utterance, re.IGNORECASE)
+    if not match:
+        return None
+    content = match.group(1).strip().rstrip()
+    if is_dictation_start_command(utterance):
+        return None
+    if content:
+        return content
+    return None
+
+
+def looks_like_browser_command(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    return bool(
+        re.search(
+            r"\b(click|press|tap|select|open|go to|navigate|scroll|reload|refresh|back|forward|zoom|"
+            r"maximize|fullscreen|search|find|read|list|switch|tab|quit|close browser|screenshot)\b",
+            lowered,
+        )
+    )
 
 
 def build_fast_path_plan(user_text: str, state: BrowserState) -> Optional[PlannerResult]:
@@ -2024,6 +2129,13 @@ def build_fast_path_plan(user_text: str, state: BrowserState) -> Optional[Planne
         return PlannerResult(actions=[{"type": "list_actions"}], spoken_response="Here are clickable items.")
     if re.search(r"\b(read page|read this page|read main|read main content)\b", lowered):
         return PlannerResult(actions=[{"type": "read_main"}], spoken_response="")
+
+    inline_dictation = extract_inline_dictation_text(utterance)
+    if inline_dictation:
+        return PlannerResult(
+            actions=[{"type": "type_text", "target": FOCUSED_TARGET, "text": inline_dictation}],
+            spoken_response="Dictated.",
+        )
 
     url_candidate = _extract_url_candidate(utterance)
     if url_candidate and re.search(r"\b(go to|open|navigate to)\b", lowered):
@@ -2459,6 +2571,42 @@ async def main() -> None:
                 push_history(state, user_text, spoken)
                 if should_stop:
                     running = False
+                continue
+
+            if is_dictation_stop_command(user_text):
+                state.dictation_mode = False
+                speak("Dictation mode off.")
+                push_history(state, user_text, "Dictation mode off.")
+                if ui:
+                    ui.set_status("Ready")
+                continue
+
+            if is_dictation_start_command(user_text):
+                state.dictation_mode = True
+                speak("Dictation mode on. Click a textbox, then speak.")
+                push_history(state, user_text, "Dictation mode on.")
+                if ui:
+                    ui.set_status("Ready")
+                continue
+
+            if state.dictation_mode and not looks_like_browser_command(user_text):
+                if ui:
+                    ui.set_status("Executing...")
+                messages, should_stop, had_error = await asyncio.to_thread(
+                    execute_actions,
+                    [{"type": "type_text", "target": FOCUSED_TARGET, "text": user_text}],
+                    state,
+                )
+                if had_error:
+                    spoken = messages[0] if messages else "I couldn't type that text."
+                else:
+                    spoken = "Dictated."
+                speak(spoken)
+                push_history(state, user_text, spoken)
+                if should_stop:
+                    running = False
+                if ui:
+                    ui.set_status("Ready")
                 continue
 
             if should_refresh_elements_for_utterance(user_text, state):

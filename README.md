@@ -198,6 +198,8 @@ There are no rigid commands to memorize. The AI understands intent. Here are exa
 - "Fill in the search box with weather forecast"
 - "Check the remember me checkbox"
 - "Click the link that says think about"
+- "Dictate into this text box" (then speak)
+- "Stop dictation"
 
 ### Reading & Understanding
 - "What's on this page?"
@@ -250,6 +252,7 @@ There are no rigid commands to memorize. The AI understands intent. Here are exa
 - Fast local command path for common intents (scroll/back/tabs/zoom/click) before LLM fallback.
 - Optional local STT backend (`faster-whisper`) for lower-latency speech recognition.
 - Outlook-specific "first email from <name>" click path with bounded re-query retries for dynamic lists.
+- Mixed modality: click with mouse, then dictate into the focused text box via voice.
 
 ## Current Limitations
 
@@ -274,6 +277,7 @@ There are no rigid commands to memorize. The AI understands intent. Here are exa
 11. If local STT has repeated backend errors, Voice Browser auto-switches to Google STT for that session.
 12. For long, slower thoughts, increase capture windows: `.\start.ps1 -PhraseLimit 40 -PauseThreshold 1.6`.
 13. To diagnose local STT failures, run with `-SttDebug`.
+14. For dictation, click the textbox first, then say `dictate into this text box`; say `stop dictation` when done.
 
 ## If TTS Is Enabled but Not Audible
 
