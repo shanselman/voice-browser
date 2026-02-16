@@ -2036,7 +2036,7 @@ def is_dictation_stop_command(text: str) -> bool:
 
 def extract_inline_dictation_text(text: str) -> Optional[str]:
     utterance = text.strip()
-    match = re.match(r"^dictate\s+(.+)$", utterance, re.IGNORECASE)
+    match = re.match(r"^dictate(?:[\s,:-]+|\.\s+)(.+)$", utterance, re.IGNORECASE)
     if not match:
         return None
     content = match.group(1).strip().rstrip()
