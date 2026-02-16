@@ -1161,19 +1161,26 @@ def _init_tts_engine() -> None:
 
 def _speak_windows_fallback(text: str, stop_event: Optional[threading.Event] = None) -> None:
     global _tts_current_process
-    escaped = text.replace("'", "''")
     command = (
         "Add-Type -AssemblyName System.Speech; "
         "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-        f"$s.Speak('{escaped}')"
+        "$t = [Console]::In.ReadToEnd(); "
+        "if ($t) { $s.Speak($t) }"
     )
     try:
         proc = subprocess.Popen(
             ["powershell", "-NoProfile", "-Command", command],
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             text=True,
         )
+        try:
+            if proc.stdin is not None:
+                proc.stdin.write(text)
+                proc.stdin.close()
+        except Exception:
+            pass
         with _tts_lock:
             _tts_current_process = proc
         while proc.poll() is None:
@@ -1428,7 +1435,6 @@ def release_single_instance_lock(handle: Optional[Any]) -> None:
     try:
         import ctypes
 
-        ctypes.windll.kernel32.ReleaseMutex(handle)
         ctypes.windll.kernel32.CloseHandle(handle)
     except Exception:
         pass
@@ -2584,7 +2590,10 @@ async def main() -> None:
                 ui.set_status("Error")
 
     try:
-        await client.stop()
+        try:
+            await client.stop()
+        except Exception:
+            pass
     finally:
         try:
             await asyncio.to_thread(run_ab_ok, ["close"])
