@@ -48,6 +48,31 @@ Optional local STT install:
 pip install faster-whisper numpy
 ```
 
+### Local STT hardware profiles (high-end GPU vs regular laptop)
+
+If you have a strong NVIDIA GPU, use CUDA for the fastest local transcription:
+```powershell
+# 1) Install NVIDIA driver + CUDA 12 runtime + cuDNN 9, then verify:
+python -c "import ctranslate2 as ct; print(ct.get_cuda_device_count())"
+
+# 2) Verify faster-whisper can initialize on GPU:
+python -c "from faster_whisper import WhisperModel; WhisperModel('base.en', device='cuda', compute_type='float16'); print('gpu-ok')"
+
+# 3) Run Voice Browser with GPU STT:
+.\start.ps1 -SttBackend faster-whisper -LocalSttDevice cuda -LocalSttComputeType float16
+```
+
+If you are on a regular laptop (or want max compatibility), use CPU `int8` mode:
+```powershell
+.\start.ps1 -SttBackend faster-whisper -LocalSttDevice cpu -LocalSttComputeType int8
+```
+
+If you want one command that "just works" across many machines, use:
+```powershell
+.\start.ps1 -SttBackend faster-whisper -LocalSttDevice auto
+```
+This tries GPU first and automatically falls back to CPU when GPU runtime libraries are missing.
+
 ### Quick validation checks
 ```powershell
 .\doctor.ps1 -Quick
