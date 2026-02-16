@@ -192,6 +192,25 @@ TARGET_STOP_WORDS = {
     "text",
 }
 FOCUSED_TARGET = "@focused"
+KEY_ALIAS_MAP = {
+    "ctrl": "Control",
+    "control": "Control",
+    "shift": "Shift",
+    "alt": "Alt",
+    "meta": "Meta",
+    "cmd": "Meta",
+    "command": "Meta",
+    "win": "Meta",
+    "left": "ArrowLeft",
+    "right": "ArrowRight",
+    "up": "ArrowUp",
+    "down": "ArrowDown",
+    "esc": "Escape",
+    "del": "Delete",
+    "ins": "Insert",
+    "pgup": "PageUp",
+    "pgdn": "PageDown",
+}
 
 
 @dataclass
@@ -1072,7 +1091,7 @@ class BrowserRuntime:
             page.locator(self._target_selector(target)).first.type(args[2], timeout=3500)
             return "✓ Typed"
         if command == "press":
-            page.keyboard.press(args[1])
+            page.keyboard.press(normalize_key_combo(args[1]))
             return "✓ Key pressed"
         if command == "scroll":
             direction = args[1].lower()
@@ -2039,6 +2058,20 @@ def looks_like_browser_command(text: str) -> bool:
             lowered,
         )
     )
+
+
+def normalize_key_combo(key_combo: str) -> str:
+    parts = [p.strip() for p in key_combo.split("+") if p.strip()]
+    if not parts:
+        return key_combo
+    normalized: List[str] = []
+    for part in parts:
+        mapped = KEY_ALIAS_MAP.get(part.lower())
+        if mapped:
+            normalized.append(mapped)
+        else:
+            normalized.append(part)
+    return "+".join(normalized)
 
 
 def build_fast_path_plan(user_text: str, state: BrowserState) -> Optional[PlannerResult]:
