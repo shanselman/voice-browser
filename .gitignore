@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local editor/OS files
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Runtime artifacts
+*.log
+tmp/
+temp/
+screenshots/
+.pw-edge-profile*/
+
+# Local Copilot/session state
+.copilot/
+
