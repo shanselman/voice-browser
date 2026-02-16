@@ -211,6 +211,7 @@ KEY_ALIAS_MAP = {
     "pgup": "PageUp",
     "pgdn": "PageDown",
 }
+INTERACTION_STATES = {"idle", "command_listen", "dictation", "thinking", "executing", "confirm", "recovery"}
 
 
 @dataclass
@@ -234,6 +235,11 @@ class BrowserState:
     pending_confirmation: Optional[PlannerResult] = None
     snapshot_updated_at: float = 0.0
     dictation_mode: bool = False
+    focused_element: Dict[str, Any] = field(default_factory=dict)
+    focused_updated_at: float = 0.0
+    interaction_state: str = "idle"
+    interaction_reason: str = ""
+    interaction_updated_at: float = 0.0
 
 
 class BrowserCommandError(RuntimeError):
@@ -341,6 +347,18 @@ def log_line(message: str) -> None:
     print(message)
     if _ui_logger is not None:
         _ui_logger.add_log(message)
+
+
+def set_interaction_state(state: BrowserState, new_state: str, reason: str = "") -> None:
+    next_state = new_state if new_state in INTERACTION_STATES else "recovery"
+    old_state = state.interaction_state
+    if old_state == next_state and state.interaction_reason == reason:
+        return
+    state.interaction_state = next_state
+    state.interaction_reason = reason[:140]
+    state.interaction_updated_at = time.time()
+    if old_state != next_state:
+        log_line(f"STATE: {old_state} -> {next_state}" + (f" ({reason})" if reason else ""))
 
 
 def log_stt_debug(exc: Exception) -> None:
@@ -891,6 +909,35 @@ class BrowserRuntime:
             lines.append(f'- {role} "{name}" [ref={ref}]')
         return "\n".join(lines)
 
+    def _focused_context(self, page) -> Dict[str, Any]:
+        focused = page.evaluate(
+            """() => {
+                const el = document.activeElement;
+                if (!el) return {};
+                const tag = (el.tagName || '').toLowerCase();
+                const role = (el.getAttribute('role') || '').toLowerCase();
+                const type = (el.getAttribute('type') || '').toLowerCase();
+                const editable = !!(el.isContentEditable || tag === 'textarea' || (tag === 'input' && ![
+                    'checkbox','radio','button','submit','reset','file','range','color','date',
+                    'datetime-local','month','time','week'
+                ].includes(type)) || role === 'textbox');
+                const aria = (el.getAttribute('aria-label') || '').trim();
+                const placeholder = (el.getAttribute('placeholder') || '').trim();
+                const title = (el.getAttribute('title') || '').trim();
+                const name = (aria || placeholder || title || (el.innerText || '').trim() || '').slice(0, 220);
+                return {
+                    tag,
+                    role,
+                    type,
+                    editable,
+                    name,
+                    ref: el.getAttribute('data-vb-ref') || '',
+                    id: (el.id || '').slice(0, 120)
+                };
+            }"""
+        )
+        return focused if isinstance(focused, dict) else {}
+
     def _click_fast(self, page, selector: str) -> None:
         locator = page.locator(selector).first
         try:
@@ -1116,6 +1163,8 @@ class BrowserRuntime:
                 },
                 ensure_ascii=True,
             )
+        if command == "focused":
+            return json.dumps(self._focused_context(page), ensure_ascii=True)
         if command == "get":
             field = args[1]
             if field == "title":
@@ -1582,17 +1631,33 @@ def refresh_page_state(state: BrowserState, mode: str = "full") -> None:
             state.title = run_ab_ok(["get", "title"])
             state.url = run_ab_ok(["get", "url"])
             state.tabs = run_ab_ok(["tab"])
+    try:
+        focused_payload = run_ab_ok(["focused"])
+        focused = json.loads(focused_payload) if focused_payload else {}
+        if isinstance(focused, dict):
+            state.focused_element = focused
+            state.focused_updated_at = time.time()
+    except Exception:
+        pass
     if refresh_mode in {"snapshot", "full"}:
         state.snapshot = run_ab_ok(["snapshot", "-i", "-c"])
         state.elements = parse_snapshot_elements(state.snapshot)
         state.snapshot_updated_at = time.time()
 
 
+def refresh_focus_state(state: BrowserState) -> None:
+    focused_payload = run_ab_ok(["focused"])
+    focused = json.loads(focused_payload) if focused_payload else {}
+    if isinstance(focused, dict):
+        state.focused_element = focused
+        state.focused_updated_at = time.time()
+
+
 def should_refresh_elements_for_utterance(user_text: str, state: BrowserState) -> bool:
     lowered = user_text.lower()
     if not state.elements:
         return True
-    if any(word in lowered for word in ("click", "press", "tap", "select", "fill", "type", "dictate", "textbox")):
+    if any(word in lowered for word in ("click", "press", "tap", "select", "fill", "type", "dictate", "textbox", "here", "this")):
         if time.time() - state.snapshot_updated_at > SNAPSHOT_STALE_SECONDS:
             return True
     return False
@@ -1602,6 +1667,17 @@ def push_history(state: BrowserState, user_text: str, response: str) -> None:
     state.recent_history.append({"user": user_text, "assistant": response})
     if len(state.recent_history) > MAX_HISTORY_ITEMS:
         state.recent_history = state.recent_history[-MAX_HISTORY_ITEMS:]
+
+
+def summarize_focus_context(state: BrowserState) -> str:
+    focused = state.focused_element or {}
+    if not focused:
+        return "No focused element."
+    tag = str(focused.get("tag", "")).strip() or "unknown"
+    role = str(focused.get("role", "")).strip() or "none"
+    name = str(focused.get("name", "")).strip() or "unnamed"
+    editable = bool(focused.get("editable", False))
+    return f"Focused tag={tag}, role={role}, editable={editable}, name={name}."
 
 
 PLANNER_PROMPT = """You are Voice Browser Planner.
@@ -1627,6 +1703,8 @@ Rules:
 7) Prefer refs from context elements when clicking/filling.
 8) Use recent_history for follow-up requests like "click the first one" or "that button".
 9) For dictation/type intents on the currently focused textbox, use target "@focused".
+10) Resolve deictic phrases ("this", "here", "that box", "this form") to "@focused" when focused element is editable.
+11) If user asks to fill/type into "this/here" with no text value, ask one short clarification question for the text content.
 
 Allowed action types:
 open, back, forward, reload, click, fill, type_text, press, scroll,
@@ -1641,6 +1719,10 @@ def build_planner_input(user_text: str, state: BrowserState) -> str:
         "title": state.title,
         "url": state.url,
         "tabs": state.tabs,
+        "focused_element": state.focused_element,
+        "focused_summary": summarize_focus_context(state),
+        "dictation_mode": state.dictation_mode,
+        "interaction_state": state.interaction_state,
         "elements": state.elements[:MAX_CONTEXT_ELEMENTS],
         "recent_history": state.recent_history[-MAX_HISTORY_ITEMS:],
     }
@@ -2074,6 +2156,40 @@ def normalize_key_combo(key_combo: str) -> str:
     return "+".join(normalized)
 
 
+def has_editable_focus(state: BrowserState) -> bool:
+    focused = state.focused_element or {}
+    return bool(focused.get("editable", False))
+
+
+def extract_deictic_entry_text(text: str) -> Optional[str]:
+    utterance = text.strip()
+    patterns = (
+        r"\b(?:enter|type|write|put|insert)\s+(.+?)\s+(?:in|into)\s+(?:this|that|the)?\s*(?:text ?box|textbox|field|input|form)\b",
+        r"\b(?:fill(?:\s+out)?|fill in)\s+(?:this|that|the)?\s*(?:text ?box|textbox|field|input)\s+(?:with\s+)?(.+)$",
+        r"\b(?:enter|type|write|put|insert)\s+(.+?)\s+(?:here|there)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, utterance, re.IGNORECASE)
+        if not match:
+            continue
+        content = (match.group(1) or "").strip().rstrip(".!?")
+        if content:
+            return content
+    return None
+
+
+def is_deictic_text_entry_request(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    return bool(
+        re.search(
+            r"\b(fill(?:\s+out)?|fill in|enter text|type|write|put text|insert text)\b.*\b(this|here|that)\b",
+            lowered,
+        )
+    )
+
+
 def build_fast_path_plan(user_text: str, state: BrowserState) -> Optional[PlannerResult]:
     utterance = user_text.strip()
     lowered = utterance.lower()
@@ -2162,6 +2278,23 @@ def build_fast_path_plan(user_text: str, state: BrowserState) -> Optional[Planne
         return PlannerResult(actions=[{"type": "list_actions"}], spoken_response="Here are clickable items.")
     if re.search(r"\b(read page|read this page|read main|read main content)\b", lowered):
         return PlannerResult(actions=[{"type": "read_main"}], spoken_response="")
+
+    deictic_entry_text = extract_deictic_entry_text(utterance)
+    if deictic_entry_text:
+        return PlannerResult(
+            actions=[{"type": "type_text", "target": FOCUSED_TARGET, "text": deictic_entry_text}],
+            spoken_response="Typed.",
+        )
+    if is_deictic_text_entry_request(utterance):
+        if has_editable_focus(state):
+            return PlannerResult(
+                needs_clarification=True,
+                clarification_question="What should I type here?",
+            )
+        return PlannerResult(
+            needs_clarification=True,
+            clarification_question="Click the field you want first, then tell me what to type.",
+        )
 
     inline_dictation = extract_inline_dictation_text(utterance)
     if inline_dictation:
@@ -2439,6 +2572,7 @@ async def main() -> None:
     recognizer.phrase_threshold = max(0.1, PHRASE_THRESHOLD)
     microphone, selected_mic_index, selected_mic_name, microphone_names = create_microphone()
     state = BrowserState()
+    set_interaction_state(state, "idle", "startup")
     unknown_streak = 0
     planner_failure_streak = 0
     ui: Optional[MiniControlUI] = None
@@ -2515,6 +2649,10 @@ async def main() -> None:
 
     running = True
     while running:
+        if state.dictation_mode:
+            set_interaction_state(state, "dictation", "awaiting dictation text")
+        else:
+            set_interaction_state(state, "command_listen", "awaiting command")
         log_line("\nListening...")
         try:
             typed_utterance = ""
@@ -2578,10 +2716,16 @@ async def main() -> None:
             if not user_text:
                 continue
             unknown_streak = 0
+            set_interaction_state(state, "thinking", "processing utterance")
             if ui:
                 ui.set_status("Thinking...")
+            try:
+                await asyncio.to_thread(refresh_focus_state, state)
+            except BrowserCommandError:
+                pass
 
             if state.pending_confirmation is not None:
+                set_interaction_state(state, "confirm", "awaiting yes/no")
                 decision = classify_yes_no(user_text)
                 if decision is None:
                     speak("Please say yes or no.")
@@ -2593,6 +2737,7 @@ async def main() -> None:
 
                 confirmed_plan = state.pending_confirmation
                 state.pending_confirmation = None
+                set_interaction_state(state, "executing", "confirmed action")
                 if ui:
                     ui.set_status("Executing...")
                 messages, should_stop, had_error = await asyncio.to_thread(execute_actions, confirmed_plan.actions, state)
@@ -2608,6 +2753,7 @@ async def main() -> None:
 
             if is_dictation_stop_command(user_text):
                 state.dictation_mode = False
+                set_interaction_state(state, "command_listen", "dictation stopped")
                 speak("Dictation mode off.")
                 push_history(state, user_text, "Dictation mode off.")
                 if ui:
@@ -2616,6 +2762,7 @@ async def main() -> None:
 
             if is_dictation_start_command(user_text):
                 state.dictation_mode = True
+                set_interaction_state(state, "dictation", "dictation enabled")
                 speak("Dictation mode on. Click a textbox, then speak.")
                 push_history(state, user_text, "Dictation mode on.")
                 if ui:
@@ -2623,6 +2770,7 @@ async def main() -> None:
                 continue
 
             if state.dictation_mode and not looks_like_browser_command(user_text):
+                set_interaction_state(state, "executing", "dictation write")
                 if ui:
                     ui.set_status("Executing...")
                 messages, should_stop, had_error = await asyncio.to_thread(
@@ -2651,10 +2799,12 @@ async def main() -> None:
             fast_plan = build_fast_path_plan(user_text, state)
             if fast_plan is not None:
                 if any(action["type"] in DESTRUCTIVE_ACTIONS for action in fast_plan.actions):
+                    set_interaction_state(state, "confirm", "destructive fast-path action")
                     state.pending_confirmation = fast_plan
                     speak(build_confirmation_prompt(fast_plan))
                     push_history(state, user_text, "Asked for confirmation")
                     continue
+                set_interaction_state(state, "executing", "fast-path action")
                 if ui:
                     ui.set_status("Executing...")
                 messages, should_stop, had_error = await asyncio.to_thread(execute_actions, fast_plan.actions, state)
@@ -2678,6 +2828,7 @@ async def main() -> None:
                 raw_response = None
 
             if raw_response is None:
+                set_interaction_state(state, "recovery", "planner unavailable")
                 planner_failure_streak += 1
                 if planner_failure_streak >= 2:
                     speak_and_wait("Planner connection dropped. Reconnecting.")
@@ -2701,12 +2852,14 @@ async def main() -> None:
                     plan = fallback_plan
                     parse_errors = []
                 else:
+                    set_interaction_state(state, "recovery", "planner parse error")
                     speak("I had trouble interpreting that request. Please try again.")
                     log_line("  Planner parse errors: " + "; ".join(parse_errors))
                     push_history(state, user_text, "Parse error")
                     continue
 
             if plan.needs_clarification:
+                set_interaction_state(state, "confirm", "clarification requested")
                 question = plan.clarification_question or "Can you clarify what you want me to do?"
                 speak(question)
                 push_history(state, user_text, question)
@@ -2720,11 +2873,13 @@ async def main() -> None:
                 continue
 
             if any(action["type"] in DESTRUCTIVE_ACTIONS for action in plan.actions):
+                set_interaction_state(state, "confirm", "destructive planned action")
                 state.pending_confirmation = plan
                 speak(build_confirmation_prompt(plan))
                 push_history(state, user_text, "Asked for confirmation")
                 continue
 
+            set_interaction_state(state, "executing", "planned action")
             if ui:
                 ui.set_status("Executing...")
             messages, should_stop, had_error = await asyncio.to_thread(execute_actions, plan.actions, state)
@@ -2740,10 +2895,12 @@ async def main() -> None:
                 ui.set_status("Ready")
 
         except sr.WaitTimeoutError:
+            set_interaction_state(state, "command_listen", "listen timeout")
             if ui:
                 ui.set_status("Ready")
             continue
         except sr.UnknownValueError:
+            set_interaction_state(state, "command_listen", "unknown speech")
             unknown_streak += 1
             log_line("  Could not understand speech; listening again.")
             if unknown_streak in {3, 6}:
@@ -2754,6 +2911,7 @@ async def main() -> None:
             if ui:
                 ui.set_status("Ready")
         except sr.RequestError as exc:
+            set_interaction_state(state, "recovery", "speech request error")
             speak(f"Speech recognition error: {exc}")
             if ui:
                 ui.set_status("Speech recognition error")
@@ -2765,6 +2923,7 @@ async def main() -> None:
             speak_and_wait("Interrupted. Closing browser.")
             running = False
         except Exception as exc:
+            set_interaction_state(state, "recovery", "unexpected error")
             log_line(f"  Unexpected error: {exc}")
             speak("Something went wrong. Please try again.")
             if ui:

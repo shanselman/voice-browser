@@ -200,6 +200,8 @@ There are no rigid commands to memorize. The AI understands intent. Here are exa
 - "Click the link that says think about"
 - "Dictate into this text box" (then speak)
 - "Stop dictation"
+- "Enter hello world in this text box"
+- "Type this here: thanks for your help"
 
 ### Reading & Understanding
 - "What's on this page?"
@@ -253,6 +255,7 @@ There are no rigid commands to memorize. The AI understands intent. Here are exa
 - Optional local STT backend (`faster-whisper`) for lower-latency speech recognition.
 - Outlook-specific "first email from <name>" click path with bounded re-query retries for dynamic lists.
 - Mixed modality: click with mouse, then dictate into the focused text box via voice.
+- Deictic text-entry handling for "this/here/that box" now prefers the focused editable control.
 
 ## Current Limitations
 
