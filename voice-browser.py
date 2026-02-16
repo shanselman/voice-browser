@@ -1808,6 +1808,17 @@ def refresh_page_state(state: BrowserState, mode: str = "full") -> None:
             state.title = run_ab_ok(["get", "title"])
             state.url = run_ab_ok(["get", "url"])
             state.tabs = run_ab_ok(["tab"])
+    if refresh_mode in {"snapshot", "full"}:
+        state.snapshot = run_ab_ok(["snapshot", "-i", "-c"])
+        state.elements = parse_snapshot_elements(state.snapshot)
+        state.snapshot_updated_at = time.time()
+    try:
+        refresh_focus_state(state)
+    except Exception:
+        pass
+
+
+def refresh_focus_state(state: BrowserState) -> None:
     try:
         focused_payload = run_ab_ok(["focused"])
         focused = json.loads(focused_payload) if focused_payload else {}
@@ -1822,24 +1833,6 @@ def refresh_page_state(state: BrowserState, mode: str = "full") -> None:
             state.focused_updated_at = time.time()
     except Exception:
         pass
-    if refresh_mode in {"snapshot", "full"}:
-        state.snapshot = run_ab_ok(["snapshot", "-i", "-c"])
-        state.elements = parse_snapshot_elements(state.snapshot)
-        state.snapshot_updated_at = time.time()
-
-
-def refresh_focus_state(state: BrowserState) -> None:
-    focused_payload = run_ab_ok(["focused"])
-    focused = json.loads(focused_payload) if focused_payload else {}
-    if isinstance(focused, dict):
-        state.focused_element = focused.get("active", {}) if isinstance(focused.get("active"), dict) else {}
-        state.last_pointer_target = (
-            focused.get("last_pointer_target", {}) if isinstance(focused.get("last_pointer_target"), dict) else {}
-        )
-        candidates = focused.get("editable_candidates", [])
-        state.editable_candidates = candidates if isinstance(candidates, list) else []
-        state.form_summary = focused.get("form_summary", {}) if isinstance(focused.get("form_summary"), dict) else {}
-        state.focused_updated_at = time.time()
 
 
 def should_refresh_elements_for_utterance(user_text: str, state: BrowserState) -> bool:
@@ -2234,14 +2227,14 @@ def resolve_ref_from_text(target_text: str, state: BrowserState) -> Optional[str
     return scored[0][2]
 
 
-def resolve_action_target(target: str, state: BrowserState) -> str:
+def resolve_action_target(target: str, state: BrowserState, action_type: str = "") -> str:
     trimmed = target.strip()
     if not trimmed:
         return target
     if trimmed.lower() in {FOCUSED_TARGET, ":focus"}:
         return FOCUSED_TARGET
     if is_deictic_target_text(trimmed):
-        return resolve_deictic_target(state)
+        return resolve_deictic_target(state, for_action=action_type or "type_text")
     if re.fullmatch(r"@?e\d+", trimmed.lower()):
         return f"@{trimmed.lstrip('@').lower()}"
     if looks_like_selector(trimmed):
@@ -2254,6 +2247,12 @@ def build_click_fallback_plan(user_text: str, state: BrowserState) -> Optional[P
     lowered = user_text.strip().lower()
     if not any(word in lowered for word in ("click", "press", "tap", "select")):
         return None
+    phrase = normalize_click_query(extract_click_phrase(user_text))
+    if is_deictic_target_text(phrase) or re.search(r"\b(this|here|that)\b", phrase):
+        return PlannerResult(
+            actions=[{"type": "click", "target": resolve_deictic_target(state, for_action="click")}],
+            spoken_response="Clicked.",
+        )
     target = resolve_ref_from_text(user_text, state)
     if not target:
         return None
@@ -2282,7 +2281,9 @@ def build_text_entry_fallback_plan(user_text: str, state: BrowserState) -> Optio
     lowered = utterance.lower()
     if not lowered:
         return None
-    if not any(word in lowered for word in ("type", "fill", "enter", "write", "insert", "dictate")):
+    if re.search(r"\b(click|tap|press|select|open)\b", lowered):
+        return None
+    if not re.search(r"\b(type|fill|enter|write|insert|dictate)\b", lowered):
         return None
 
     content = extract_inline_dictation_text(utterance)
@@ -2293,7 +2294,7 @@ def build_text_entry_fallback_plan(user_text: str, state: BrowserState) -> Optio
 
     if content:
         return PlannerResult(
-            actions=[{"type": "type_text", "target": resolve_deictic_target(state), "text": content}],
+            actions=[{"type": "type_text", "target": resolve_deictic_target(state, for_action="type_text"), "text": content}],
             spoken_response="Typed.",
         )
 
@@ -2432,14 +2433,24 @@ def is_deictic_target_text(text: str) -> bool:
     return any(phrase in lowered for phrase in ("this box", "this field", "this textbox", "this input", "this form"))
 
 
-def resolve_deictic_target(state: BrowserState) -> str:
+def resolve_deictic_target(state: BrowserState, for_action: str = "type_text") -> str:
+    action = (for_action or "type_text").strip().lower()
+    pointer = state.last_pointer_target or {}
+    pointer_ref = str(pointer.get("ref", "")).strip()
+    pointer_ref_value = f"@{pointer_ref}" if pointer_ref.startswith("e") else ""
+
+    if action == "click":
+        if pointer_ref_value:
+            return pointer_ref_value
+        focused_ref = str((state.focused_element or {}).get("ref", "")).strip()
+        if focused_ref.startswith("e"):
+            return f"@{focused_ref}"
+        return FOCUSED_TARGET
+
     if has_editable_focus(state):
         return FOCUSED_TARGET
-    pointer = state.last_pointer_target or {}
-    if pointer.get("editable", False):
-        pointer_ref = str(pointer.get("ref", "")).strip()
-        if pointer_ref.startswith("e"):
-            return f"@{pointer_ref}"
+    if pointer.get("editable", False) and pointer_ref_value:
+        return pointer_ref_value
     for candidate in state.editable_candidates or []:
         if not isinstance(candidate, dict):
             continue
@@ -2572,7 +2583,7 @@ def build_fast_path_plan(user_text: str, state: BrowserState) -> Optional[Planne
     deictic_entry_text = extract_deictic_entry_text(utterance)
     if deictic_entry_text:
         return PlannerResult(
-            actions=[{"type": "type_text", "target": FOCUSED_TARGET, "text": deictic_entry_text}],
+            actions=[{"type": "type_text", "target": resolve_deictic_target(state, for_action="type_text"), "text": deictic_entry_text}],
             spoken_response="Typed.",
         )
     if is_deictic_text_entry_request(utterance):
@@ -2640,15 +2651,15 @@ def execute_action(action: Dict[str, Any], state: BrowserState) -> Tuple[str, st
         run_ab_ok(["reload"])
         return "Reloaded the page.", "full", False
     if action_type == "click":
-        target = resolve_action_target(action["target"], state)
+        target = resolve_action_target(action["target"], state, "click")
         run_ab_ok(["click", target])
         return "Clicked the requested item.", "snapshot", False
     if action_type == "fill":
-        target = resolve_action_target(action["target"], state)
+        target = resolve_action_target(action["target"], state, "fill")
         run_ab_ok(["fill", target, action["text"]])
         return "Filled the field.", "snapshot", False
     if action_type == "type_text":
-        target = resolve_action_target(action["target"], state)
+        target = resolve_action_target(action["target"], state, "type_text")
         run_ab_ok(["type", target, action["text"]])
         return "Typed text.", "snapshot", False
     if action_type == "press":
@@ -3147,9 +3158,14 @@ async def main() -> None:
             plan, parse_errors = parse_planner_response(raw_response)
 
             if parse_errors and not plan.actions and not plan.needs_clarification and not plan.quit:
-                fallback_plan = build_text_entry_fallback_plan(user_text, state)
-                if fallback_plan is None:
+                if re.search(r"\b(click|tap|press|select|open)\b", user_text.strip().lower()):
                     fallback_plan = build_click_fallback_plan(user_text, state)
+                    if fallback_plan is None:
+                        fallback_plan = build_text_entry_fallback_plan(user_text, state)
+                else:
+                    fallback_plan = build_text_entry_fallback_plan(user_text, state)
+                    if fallback_plan is None:
+                        fallback_plan = build_click_fallback_plan(user_text, state)
                 if fallback_plan is not None:
                     plan = fallback_plan
                     parse_errors = []

@@ -18,11 +18,12 @@ def run():
 
     state = mod.BrowserState()
     state.focused_element = {"editable": True, "name": "Message body"}
-    state.last_pointer_target = {"editable": False, "name": "Send button"}
+    state.last_pointer_target = {"editable": False, "name": "Send button", "ref": "e9"}
     state.editable_candidates = [{"ref": "e4", "editable": True, "name": "Body"}]
 
     assert mod.resolve_action_target("this", state) == mod.FOCUSED_TARGET
     assert mod.resolve_action_target("here", state) == mod.FOCUSED_TARGET
+    assert mod.resolve_action_target("this", state, "click") == "@e9"
 
     plan = mod.build_fast_path_plan("enter hello world in this text box", state)
     assert plan and plan.actions and plan.actions[0]["type"] == "type_text"
@@ -31,6 +32,8 @@ def run():
 
     clarify_plan = mod.build_fast_path_plan("fill out this form", state)
     assert clarify_plan and clarify_plan.needs_clarification
+
+    assert mod.build_text_entry_fallback_plan("click the enter button", state) is None
 
     assert mod.extract_inline_dictation_text("dictate: this is a test") == "this is a test"
     assert mod.normalize_key_combo("Shift+Ctrl+Right") == "Shift+Control+ArrowRight"

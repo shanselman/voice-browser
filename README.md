@@ -262,6 +262,7 @@ There are no rigid commands to memorize. The AI understands intent. Here are exa
 - Mixed modality: click with mouse, then dictate into the focused text box via voice.
 - Deictic text-entry handling for "this/here/that box" now prefers the focused editable control.
 - Focus-aware context now tracks focused field, recent pointer target, and nearby editable controls for better "this/here" intent resolution.
+- Deictic click commands like "click this" now prefer the most recent pointer target when available.
 
 ## Current Limitations
 
