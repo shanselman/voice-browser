@@ -19,6 +19,7 @@
 #   .\start.ps1 -DisableEchoGuard
 #   .\start.ps1 -SttBackend faster-whisper -LocalSttModel base.en
 #   .\start.ps1 -PhraseLimit 40 -PauseThreshold 1.6
+#   .\start.ps1 -CommandPhraseLimit 6 -DictationPhraseLimit 45
 #   .\start.ps1 -SttDebug
 
 param(
@@ -45,6 +46,8 @@ param(
     [switch]$SttDebug,
     [int]$ListenTimeout = -1,
     [int]$PhraseLimit = -1,
+    [int]$CommandPhraseLimit = -1,
+    [int]$DictationPhraseLimit = -1,
     [double]$PauseThreshold = -1,
     [double]$NonSpeakingDuration = -1,
     [double]$PhraseThreshold = -1,
@@ -140,6 +143,14 @@ if ($ListenTimeout -gt 0) {
 
 if ($PhraseLimit -gt 0) {
     $env:VOICE_BROWSER_PHRASE_LIMIT = "$PhraseLimit"
+}
+
+if ($CommandPhraseLimit -gt 0) {
+    $env:VOICE_BROWSER_COMMAND_PHRASE_LIMIT = "$CommandPhraseLimit"
+}
+
+if ($DictationPhraseLimit -gt 0) {
+    $env:VOICE_BROWSER_DICTATION_PHRASE_LIMIT = "$DictationPhraseLimit"
 }
 
 if ($PauseThreshold -gt 0) {

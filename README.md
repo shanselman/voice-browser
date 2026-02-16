@@ -77,6 +77,7 @@ This tries GPU first and automatically falls back to CPU when GPU runtime librar
 ```powershell
 .\doctor.ps1 -Quick
 python -m py_compile .\voice-browser.py .\mini_ui_host.py
+python .\smoke_tests.py
 ```
 
 Note: Voice Browser always runs in headed mode (visible browser window).
@@ -128,6 +129,9 @@ Note: Voice Browser always runs in headed mode (visible browser window).
 
 # Slow, longer speech:
 .\start.ps1 -PhraseLimit 40 -PauseThreshold 1.6
+
+# Faster command turns + longer dictation turns:
+.\start.ps1 -CommandPhraseLimit 6 -DictationPhraseLimit 45
 
 # STT diagnostics (prints exception type/trace for local STT failures):
 .\start.ps1 -SttBackend faster-whisper -SttDebug
@@ -202,6 +206,7 @@ There are no rigid commands to memorize. The AI understands intent. Here are exa
 - "Stop dictation"
 - "Enter hello world in this text box"
 - "Type this here: thanks for your help"
+- "Fill out this form" (it now uses focused-field guidance/clarification)
 
 ### Reading & Understanding
 - "What's on this page?"
@@ -256,6 +261,7 @@ There are no rigid commands to memorize. The AI understands intent. Here are exa
 - Outlook-specific "first email from <name>" click path with bounded re-query retries for dynamic lists.
 - Mixed modality: click with mouse, then dictate into the focused text box via voice.
 - Deictic text-entry handling for "this/here/that box" now prefers the focused editable control.
+- Focus-aware context now tracks focused field, recent pointer target, and nearby editable controls for better "this/here" intent resolution.
 
 ## Current Limitations
 
@@ -281,6 +287,7 @@ There are no rigid commands to memorize. The AI understands intent. Here are exa
 12. For long, slower thoughts, increase capture windows: `.\start.ps1 -PhraseLimit 40 -PauseThreshold 1.6`.
 13. To diagnose local STT failures, run with `-SttDebug`.
 14. For dictation, click the textbox first, then say `dictate into this text box`; say `stop dictation` when done.
+15. For responsiveness, keep command phrase limit lower than dictation phrase limit.
 
 ## If TTS Is Enabled but Not Audible
 
@@ -308,10 +315,14 @@ Environment variables for customization:
 | `VOICE_BROWSER_TTS_ENABLED` | `0` | Set to `1` to enable spoken responses |
 | `VOICE_BROWSER_TTS_BACKEND` | `pyttsx3` | `windows`, `pyttsx3`, or `auto` |
 | `VOICE_BROWSER_TTS_RATE` | `180` | Speech rate (words per minute) |
+| `VOICE_BROWSER_METRICS` | `1` | Set to `0` to disable runtime latency metric collection/logging |
+| `VOICE_BROWSER_METRICS_LOG_EVERY` | `40` | How many metric events between summary log lines |
 | `VOICE_BROWSER_SPEAK_STARTUP` | `0` | Set to `1` to speak startup status prompts |
 | `VOICE_BROWSER_SPEAK_READY` | `0` | Set to `1` to speak a “Ready” prompt |
 | `VOICE_BROWSER_LISTEN_TIMEOUT` | `10` | Seconds of silence before re-listening |
 | `VOICE_BROWSER_PHRASE_LIMIT` | `15` | Max seconds for a single phrase |
+| `VOICE_BROWSER_COMMAND_PHRASE_LIMIT` | `8` | Phrase limit used while in command-listen mode |
+| `VOICE_BROWSER_DICTATION_PHRASE_LIMIT` | `15` | Phrase limit used while in dictation mode |
 | `VOICE_BROWSER_PAUSE_THRESHOLD` | `1.2` | Seconds of trailing silence before phrase capture ends |
 | `VOICE_BROWSER_NON_SPEAKING_DURATION` | `0.5` | Internal silence padding retained around phrases |
 | `VOICE_BROWSER_PHRASE_THRESHOLD` | `0.3` | Minimum speaking audio before phrase is considered valid |

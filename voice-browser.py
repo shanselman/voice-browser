@@ -59,9 +59,13 @@ SPEAK_STARTUP_STATUS = os.environ.get("VOICE_BROWSER_SPEAK_STARTUP", "0").strip(
 SPEAK_READY_MESSAGE = os.environ.get("VOICE_BROWSER_SPEAK_READY", "0").strip() == "1"
 LISTEN_TIMEOUT = int(os.environ.get("VOICE_BROWSER_LISTEN_TIMEOUT", "10"))
 PHRASE_TIME_LIMIT = int(os.environ.get("VOICE_BROWSER_PHRASE_LIMIT", "15"))
+COMMAND_PHRASE_LIMIT = max(3, int(os.environ.get("VOICE_BROWSER_COMMAND_PHRASE_LIMIT", "8")))
+DICTATION_PHRASE_LIMIT = max(5, int(os.environ.get("VOICE_BROWSER_DICTATION_PHRASE_LIMIT", str(PHRASE_TIME_LIMIT))))
 PAUSE_THRESHOLD = float(os.environ.get("VOICE_BROWSER_PAUSE_THRESHOLD", "1.2"))
 NON_SPEAKING_DURATION = float(os.environ.get("VOICE_BROWSER_NON_SPEAKING_DURATION", "0.5"))
 PHRASE_THRESHOLD = float(os.environ.get("VOICE_BROWSER_PHRASE_THRESHOLD", "0.3"))
+METRICS_ENABLED = os.environ.get("VOICE_BROWSER_METRICS", "1").strip() != "0"
+METRICS_LOG_EVERY = max(10, int(os.environ.get("VOICE_BROWSER_METRICS_LOG_EVERY", "40")))
 MAX_CONTEXT_ELEMENTS = int(os.environ.get("VOICE_BROWSER_MAX_ELEMENTS", "40"))
 MAX_HISTORY_ITEMS = int(os.environ.get("VOICE_BROWSER_MAX_HISTORY", "6"))
 LLM_TIMEOUT_SECONDS = int(os.environ.get("VOICE_BROWSER_LLM_TIMEOUT", "30"))
@@ -212,6 +216,32 @@ KEY_ALIAS_MAP = {
     "pgdn": "PageDown",
 }
 INTERACTION_STATES = {"idle", "command_listen", "dictation", "thinking", "executing", "confirm", "recovery"}
+GENERIC_TEXT_VALUES = {
+    "text",
+    "some text",
+    "something",
+    "something here",
+    "anything",
+    "it",
+    "this",
+    "that",
+    "value",
+}
+DEICTIC_TARGET_PHRASES = {
+    "this",
+    "here",
+    "that",
+    "this box",
+    "that box",
+    "this field",
+    "that field",
+    "this textbox",
+    "that textbox",
+    "this input",
+    "that input",
+    "this form",
+    "that form",
+}
 
 
 @dataclass
@@ -236,6 +266,9 @@ class BrowserState:
     snapshot_updated_at: float = 0.0
     dictation_mode: bool = False
     focused_element: Dict[str, Any] = field(default_factory=dict)
+    last_pointer_target: Dict[str, Any] = field(default_factory=dict)
+    editable_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    form_summary: Dict[str, Any] = field(default_factory=dict)
     focused_updated_at: float = 0.0
     interaction_state: str = "idle"
     interaction_reason: str = ""
@@ -341,12 +374,59 @@ _local_stt_active_device = ""
 _local_stt_active_compute_type = ""
 _effective_stt_backend = "google"
 _local_stt_backend_error_streak = 0
+_metrics_lock = threading.Lock()
+_latency_metrics: Dict[str, List[float]] = {}
+_metrics_event_count = 0
 
 
 def log_line(message: str) -> None:
     print(message)
     if _ui_logger is not None:
         _ui_logger.add_log(message)
+
+
+def _percentile(values: List[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    sorted_values = sorted(values)
+    rank = max(0, min(len(sorted_values) - 1, int(round((percentile / 100.0) * (len(sorted_values) - 1)))))
+    return sorted_values[rank]
+
+
+def _format_metric_summary(name: str, values: List[float]) -> str:
+    p50 = _percentile(values, 50) * 1000.0
+    p95 = _percentile(values, 95) * 1000.0
+    return f"{name}:p50={p50:.0f}ms p95={p95:.0f}ms n={len(values)}"
+
+
+def record_latency_metric(name: str, seconds: float) -> None:
+    global _metrics_event_count
+    if not METRICS_ENABLED:
+        return
+    with _metrics_lock:
+        bucket = _latency_metrics.setdefault(name, [])
+        bucket.append(max(0.0, seconds))
+        if len(bucket) > 250:
+            del bucket[:-250]
+        _metrics_event_count += 1
+        should_log = (_metrics_event_count % METRICS_LOG_EVERY) == 0
+        snapshot = {k: list(v) for k, v in _latency_metrics.items()} if should_log else None
+    if should_log and snapshot:
+        preferred_order = ["stt_total", "planner_call", "execute_actions_total", "browser_command"]
+        parts: List[str] = []
+        for key in preferred_order:
+            if key in snapshot and snapshot[key]:
+                parts.append(_format_metric_summary(key, snapshot[key]))
+        for key in sorted(snapshot.keys()):
+            if key in preferred_order:
+                continue
+            values = snapshot[key]
+            if values:
+                parts.append(_format_metric_summary(key, values))
+        if parts:
+            log_line("METRICS: " + " | ".join(parts[:5]))
 
 
 def set_interaction_state(state: BrowserState, new_state: str, reason: str = "") -> None:
@@ -491,45 +571,54 @@ def _transcribe_local(audio: sr.AudioData) -> str:
 
 
 def transcribe_audio(recognizer: sr.Recognizer, audio: sr.AudioData) -> str:
+    started = time.perf_counter()
+    backend_label = "google"
     global _effective_stt_backend, _local_stt_backend_error_streak
-    if _effective_stt_backend == "faster-whisper":
-        try:
-            text = _transcribe_local(audio)
-            if text:
-                _local_stt_backend_error_streak = 0
-                return text
-            raise sr.UnknownValueError()
-        except sr.UnknownValueError:
-            # Empty/noisy audio is not a backend failure; let caller handle it consistently.
-            raise
-        except Exception as exc:
-            error_text = str(exc).lower()
-            log_stt_debug(exc)
-            if any(marker in error_text for marker in ("cublas", "cuda", "cudnn", "onnxruntime")):
-                if _switch_local_stt_to_cpu():
-                    log_line("WARN: GPU STT unavailable; switched local STT to CPU (int8).")
-                    try:
-                        text = _transcribe_local(audio)
-                        if text:
-                            _local_stt_backend_error_streak = 0
-                            return text
-                        raise sr.UnknownValueError()
-                    except sr.UnknownValueError:
-                        raise
-                    except Exception as retry_exc:
-                        log_stt_debug(retry_exc)
-                        log_line(
-                            f"WARN: local STT retry failed ({_format_stt_error(retry_exc)}); falling back to Google STT."
-                        )
+    try:
+        if _effective_stt_backend == "faster-whisper":
+            backend_label = "local"
+            try:
+                text = _transcribe_local(audio)
+                if text:
+                    _local_stt_backend_error_streak = 0
+                    return text
+                raise sr.UnknownValueError()
+            except sr.UnknownValueError:
+                # Empty/noisy audio is not a backend failure; let caller handle it consistently.
+                raise
+            except Exception as exc:
+                error_text = str(exc).lower()
+                log_stt_debug(exc)
+                if any(marker in error_text for marker in ("cublas", "cuda", "cudnn", "onnxruntime")):
+                    if _switch_local_stt_to_cpu():
+                        log_line("WARN: GPU STT unavailable; switched local STT to CPU (int8).")
+                        try:
+                            text = _transcribe_local(audio)
+                            if text:
+                                _local_stt_backend_error_streak = 0
+                                return text
+                            raise sr.UnknownValueError()
+                        except sr.UnknownValueError:
+                            raise
+                        except Exception as retry_exc:
+                            log_stt_debug(retry_exc)
+                            log_line(
+                                f"WARN: local STT retry failed ({_format_stt_error(retry_exc)}); falling back to Google STT."
+                            )
+                    else:
+                        log_line("WARN: GPU STT unavailable and CPU local STT init failed; falling back to Google STT.")
                 else:
-                    log_line("WARN: GPU STT unavailable and CPU local STT init failed; falling back to Google STT.")
-            else:
-                log_line(f"WARN: local STT failed ({_format_stt_error(exc)}); falling back to Google STT.")
-            _local_stt_backend_error_streak += 1
-            if _local_stt_backend_error_streak >= 3:
-                _effective_stt_backend = "google"
-                log_line("WARN: local STT repeatedly failed; using Google STT for the rest of this session.")
-    return recognizer.recognize_google(audio).strip()
+                    log_line(f"WARN: local STT failed ({_format_stt_error(exc)}); falling back to Google STT.")
+                _local_stt_backend_error_streak += 1
+                if _local_stt_backend_error_streak >= 3:
+                    _effective_stt_backend = "google"
+                    log_line("WARN: local STT repeatedly failed; using Google STT for the rest of this session.")
+        backend_label = "google"
+        return recognizer.recognize_google(audio).strip()
+    finally:
+        elapsed = time.perf_counter() - started
+        record_latency_metric("stt_total", elapsed)
+        record_latency_metric(f"stt_{backend_label}", elapsed)
 
 
 def find_edge_executable() -> str:
@@ -784,7 +873,57 @@ class BrowserRuntime:
                 self._current_page = self._context.pages[-1]
             else:
                 self._current_page = self._context.new_page()
+        try:
+            self._install_interaction_observers(self._current_page)
+        except Exception:
+            pass
         return self._current_page
+
+    def _install_interaction_observers(self, page) -> None:
+        page.evaluate(
+            """() => {
+                if (window.__vbInteractionObserverInstalled) return true;
+                const describe = (el) => {
+                    if (!el || !(el instanceof Element)) return {};
+                    const tag = (el.tagName || '').toLowerCase();
+                    const role = (el.getAttribute('role') || '').toLowerCase();
+                    const type = (el.getAttribute('type') || '').toLowerCase();
+                    const editable = !!(el.isContentEditable || tag === 'textarea' || (tag === 'input' && ![
+                        'checkbox','radio','button','submit','reset','file','range','color','date',
+                        'datetime-local','month','time','week'
+                    ].includes(type)) || role === 'textbox');
+                    const aria = (el.getAttribute('aria-label') || '').trim();
+                    const placeholder = (el.getAttribute('placeholder') || '').trim();
+                    const title = (el.getAttribute('title') || '').trim();
+                    const name = (aria || placeholder || title || (el.innerText || '').trim() || '').slice(0, 220);
+                    return {
+                        tag,
+                        role,
+                        type,
+                        editable,
+                        name,
+                        ref: el.getAttribute('data-vb-ref') || '',
+                        id: (el.id || '').slice(0, 120)
+                    };
+                };
+                const ctx = window.__vbInteractionContext || { lastPointerTarget: {}, lastFocusTarget: {} };
+                window.__vbInteractionContext = ctx;
+                document.addEventListener('mousedown', (event) => {
+                    try {
+                        ctx.lastPointerTarget = describe(event.target);
+                        ctx.lastPointerAt = Date.now();
+                    } catch {}
+                }, true);
+                document.addEventListener('focusin', (event) => {
+                    try {
+                        ctx.lastFocusTarget = describe(event.target);
+                        ctx.lastFocusAt = Date.now();
+                    } catch {}
+                }, true);
+                window.__vbInteractionObserverInstalled = true;
+                return true;
+            }"""
+        )
 
     def _target_selector(self, target: str) -> str:
         if target.strip().lower() in {FOCUSED_TARGET, ":focus"}:
@@ -912,27 +1051,62 @@ class BrowserRuntime:
     def _focused_context(self, page) -> Dict[str, Any]:
         focused = page.evaluate(
             """() => {
-                const el = document.activeElement;
-                if (!el) return {};
-                const tag = (el.tagName || '').toLowerCase();
-                const role = (el.getAttribute('role') || '').toLowerCase();
-                const type = (el.getAttribute('type') || '').toLowerCase();
-                const editable = !!(el.isContentEditable || tag === 'textarea' || (tag === 'input' && ![
-                    'checkbox','radio','button','submit','reset','file','range','color','date',
-                    'datetime-local','month','time','week'
-                ].includes(type)) || role === 'textbox');
-                const aria = (el.getAttribute('aria-label') || '').trim();
-                const placeholder = (el.getAttribute('placeholder') || '').trim();
-                const title = (el.getAttribute('title') || '').trim();
-                const name = (aria || placeholder || title || (el.innerText || '').trim() || '').slice(0, 220);
+                const describe = (el) => {
+                    if (!el || !(el instanceof Element)) return {};
+                    const tag = (el.tagName || '').toLowerCase();
+                    const role = (el.getAttribute('role') || '').toLowerCase();
+                    const type = (el.getAttribute('type') || '').toLowerCase();
+                    const editable = !!(el.isContentEditable || tag === 'textarea' || (tag === 'input' && ![
+                        'checkbox','radio','button','submit','reset','file','range','color','date',
+                        'datetime-local','month','time','week'
+                    ].includes(type)) || role === 'textbox');
+                    const aria = (el.getAttribute('aria-label') || '').trim();
+                    const placeholder = (el.getAttribute('placeholder') || '').trim();
+                    const title = (el.getAttribute('title') || '').trim();
+                    const name = (aria || placeholder || title || (el.innerText || '').trim() || '').slice(0, 220);
+                    return {
+                        tag,
+                        role,
+                        type,
+                        editable,
+                        name,
+                        ref: el.getAttribute('data-vb-ref') || '',
+                        id: (el.id || '').slice(0, 120)
+                    };
+                };
+                const visible = (el) => {
+                    if (!(el instanceof HTMLElement)) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                const editableNodes = Array.from(
+                    document.querySelectorAll('input,textarea,[contenteditable="true"],[role="textbox"]')
+                );
+                const editableCandidates = [];
+                for (const el of editableNodes) {
+                    if (!visible(el)) continue;
+                    const d = describe(el);
+                    if (!d.editable) continue;
+                    editableCandidates.push(d);
+                    if (editableCandidates.length >= 10) break;
+                }
+                const active = describe(document.activeElement);
+                const interaction = window.__vbInteractionContext || {};
+                const activeEl = document.activeElement;
+                const activeForm = activeEl && typeof activeEl.closest === 'function' ? activeEl.closest('form') : null;
+                const formSummary = activeForm ? {
+                    has_form: true,
+                    controls: activeForm.querySelectorAll('input,textarea,select,button,[role="textbox"]').length
+                } : { has_form: false, controls: 0 };
                 return {
-                    tag,
-                    role,
-                    type,
-                    editable,
-                    name,
-                    ref: el.getAttribute('data-vb-ref') || '',
-                    id: (el.id || '').slice(0, 120)
+                    active,
+                    has_editable_focus: !!active.editable,
+                    editable_candidates: editableCandidates,
+                    last_pointer_target: interaction.lastPointerTarget || {},
+                    last_focus_target: interaction.lastFocusTarget || {},
+                    form_summary: formSummary
                 };
             }"""
         )
@@ -1500,6 +1674,7 @@ def _reset_browser_runtime(reason: str) -> None:
 
 def run_ab(args: List[str]) -> Tuple[str, str, int]:
     log_line(f"  RUN: {' '.join(args)}")
+    started = time.perf_counter()
     with _browser_runtime_lock:
         browser = BROWSER
         executor = _BROWSER_EXECUTOR
@@ -1527,6 +1702,8 @@ def run_ab(args: List[str]) -> Tuple[str, str, int]:
         if "browser has been closed" in lowered or "target page, context or browser has been closed" in lowered:
             _reset_browser_runtime(err)
         return "", err, 1
+    finally:
+        record_latency_metric("browser_command", time.perf_counter() - started)
 
 
 def acquire_single_instance_lock() -> Optional[Any]:
@@ -1635,7 +1812,13 @@ def refresh_page_state(state: BrowserState, mode: str = "full") -> None:
         focused_payload = run_ab_ok(["focused"])
         focused = json.loads(focused_payload) if focused_payload else {}
         if isinstance(focused, dict):
-            state.focused_element = focused
+            state.focused_element = focused.get("active", {}) if isinstance(focused.get("active"), dict) else {}
+            state.last_pointer_target = (
+                focused.get("last_pointer_target", {}) if isinstance(focused.get("last_pointer_target"), dict) else {}
+            )
+            candidates = focused.get("editable_candidates", [])
+            state.editable_candidates = candidates if isinstance(candidates, list) else []
+            state.form_summary = focused.get("form_summary", {}) if isinstance(focused.get("form_summary"), dict) else {}
             state.focused_updated_at = time.time()
     except Exception:
         pass
@@ -1649,7 +1832,13 @@ def refresh_focus_state(state: BrowserState) -> None:
     focused_payload = run_ab_ok(["focused"])
     focused = json.loads(focused_payload) if focused_payload else {}
     if isinstance(focused, dict):
-        state.focused_element = focused
+        state.focused_element = focused.get("active", {}) if isinstance(focused.get("active"), dict) else {}
+        state.last_pointer_target = (
+            focused.get("last_pointer_target", {}) if isinstance(focused.get("last_pointer_target"), dict) else {}
+        )
+        candidates = focused.get("editable_candidates", [])
+        state.editable_candidates = candidates if isinstance(candidates, list) else []
+        state.form_summary = focused.get("form_summary", {}) if isinstance(focused.get("form_summary"), dict) else {}
         state.focused_updated_at = time.time()
 
 
@@ -1677,10 +1866,20 @@ def summarize_focus_context(state: BrowserState) -> str:
     role = str(focused.get("role", "")).strip() or "none"
     name = str(focused.get("name", "")).strip() or "unnamed"
     editable = bool(focused.get("editable", False))
-    return f"Focused tag={tag}, role={role}, editable={editable}, name={name}."
+    pointer = state.last_pointer_target or {}
+    pointer_name = str(pointer.get("name", "")).strip() or "none"
+    editable_count = len(state.editable_candidates or [])
+    form_controls = int(state.form_summary.get("controls", 0)) if isinstance(state.form_summary, dict) else 0
+    return (
+        f"Focused tag={tag}, role={role}, editable={editable}, name={name}. "
+        f"Last pointer target={pointer_name}. Editable candidates={editable_count}. Form controls={form_controls}."
+    )
 
 
 PLANNER_PROMPT = """You are Voice Browser Planner.
+Mission: provide fast, robust assistive browsing for mixed modality (voice + mouse + keyboard).
+Favor deterministic behavior over creative interpretation.
+When user references "this/here/that", ground to current focused context first.
 Return ONLY a valid JSON object with this exact shape:
 {
   "quit": boolean,
@@ -1720,6 +1919,9 @@ def build_planner_input(user_text: str, state: BrowserState) -> str:
         "url": state.url,
         "tabs": state.tabs,
         "focused_element": state.focused_element,
+        "last_pointer_target": state.last_pointer_target,
+        "editable_candidates": state.editable_candidates[:8],
+        "form_summary": state.form_summary,
         "focused_summary": summarize_focus_context(state),
         "dictation_mode": state.dictation_mode,
         "interaction_state": state.interaction_state,
@@ -2038,6 +2240,8 @@ def resolve_action_target(target: str, state: BrowserState) -> str:
         return target
     if trimmed.lower() in {FOCUSED_TARGET, ":focus"}:
         return FOCUSED_TARGET
+    if is_deictic_target_text(trimmed):
+        return resolve_deictic_target(state)
     if re.fullmatch(r"@?e\d+", trimmed.lower()):
         return f"@{trimmed.lstrip('@').lower()}"
     if looks_like_selector(trimmed):
@@ -2054,6 +2258,59 @@ def build_click_fallback_plan(user_text: str, state: BrowserState) -> Optional[P
     if not target:
         return None
     return PlannerResult(actions=[{"type": "click", "target": target}], spoken_response="Clicked.")
+
+
+def _extract_general_text_entry_content(text: str) -> Optional[str]:
+    utterance = text.strip()
+    patterns = (
+        r"\b(?:type|enter|write|put|insert)\s+(.+)$",
+        r"\b(?:fill(?:\s+out)?|fill in)\s+(?:this|that|the)?\s*(?:text ?box|textbox|field|input|form)\s+(?:with\s+)?(.+)$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, utterance, re.IGNORECASE)
+        if not match:
+            continue
+        content = (match.group(1) or "").strip().rstrip(".!?")
+        if not content or is_generic_text_value(content):
+            return None
+        return content
+    return None
+
+
+def build_text_entry_fallback_plan(user_text: str, state: BrowserState) -> Optional[PlannerResult]:
+    utterance = user_text.strip()
+    lowered = utterance.lower()
+    if not lowered:
+        return None
+    if not any(word in lowered for word in ("type", "fill", "enter", "write", "insert", "dictate")):
+        return None
+
+    content = extract_inline_dictation_text(utterance)
+    if not content:
+        content = extract_deictic_entry_text(utterance)
+    if not content:
+        content = _extract_general_text_entry_content(utterance)
+
+    if content:
+        return PlannerResult(
+            actions=[{"type": "type_text", "target": resolve_deictic_target(state), "text": content}],
+            spoken_response="Typed.",
+        )
+
+    if has_editable_focus(state):
+        return PlannerResult(
+            needs_clarification=True,
+            clarification_question="What text should I enter here?",
+        )
+    if state.editable_candidates:
+        return PlannerResult(
+            needs_clarification=True,
+            clarification_question="Tell me the text to enter, and I will use the focused field.",
+        )
+    return PlannerResult(
+        needs_clarification=True,
+        clarification_question="Click the field you want first, then tell me what text to enter.",
+    )
 
 
 def _extract_tab_index_from_text(text: str) -> Optional[int]:
@@ -2161,6 +2418,37 @@ def has_editable_focus(state: BrowserState) -> bool:
     return bool(focused.get("editable", False))
 
 
+def is_generic_text_value(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", text.strip().lower())
+    return lowered in GENERIC_TEXT_VALUES
+
+
+def is_deictic_target_text(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", text.strip().lower())
+    if not lowered:
+        return False
+    if lowered in DEICTIC_TARGET_PHRASES:
+        return True
+    return any(phrase in lowered for phrase in ("this box", "this field", "this textbox", "this input", "this form"))
+
+
+def resolve_deictic_target(state: BrowserState) -> str:
+    if has_editable_focus(state):
+        return FOCUSED_TARGET
+    pointer = state.last_pointer_target or {}
+    if pointer.get("editable", False):
+        pointer_ref = str(pointer.get("ref", "")).strip()
+        if pointer_ref.startswith("e"):
+            return f"@{pointer_ref}"
+    for candidate in state.editable_candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        ref = str(candidate.get("ref", "")).strip()
+        if ref.startswith("e"):
+            return f"@{ref}"
+    return FOCUSED_TARGET
+
+
 def extract_deictic_entry_text(text: str) -> Optional[str]:
     utterance = text.strip()
     patterns = (
@@ -2173,6 +2461,8 @@ def extract_deictic_entry_text(text: str) -> Optional[str]:
         if not match:
             continue
         content = (match.group(1) or "").strip().rstrip(".!?")
+        if is_generic_text_value(content):
+            return None
         if content:
             return content
     return None
@@ -2459,6 +2749,7 @@ def _merge_refresh_mode(current: str, candidate: str) -> str:
 
 
 def execute_actions(actions: List[Dict[str, Any]], state: BrowserState) -> Tuple[List[str], bool, bool]:
+    started = time.perf_counter()
     messages: List[str] = []
     should_stop = False
     refresh_mode = "none"
@@ -2488,6 +2779,7 @@ def execute_actions(actions: List[Dict[str, Any]], state: BrowserState) -> Tuple
         except BrowserCommandError as exc:
             messages.append(f"I couldn't refresh browser context: {exc}")
             had_error = True
+    record_latency_metric("execute_actions_total", time.perf_counter() - started)
     return messages, should_stop, had_error
 
 
@@ -2536,10 +2828,14 @@ async def create_copilot_session() -> Tuple[CopilotClient, Any]:
 
 
 async def ask_copilot(session: Any, prompt: str) -> Optional[str]:
-    event = await session.send_and_wait(MessageOptions(prompt=prompt), timeout=LLM_TIMEOUT_SECONDS)
-    if event and event.type == SessionEventType.ASSISTANT_MESSAGE:
-        return event.data.content
-    return None
+    started = time.perf_counter()
+    try:
+        event = await session.send_and_wait(MessageOptions(prompt=prompt), timeout=LLM_TIMEOUT_SECONDS)
+        if event and event.type == SessionEventType.ASSISTANT_MESSAGE:
+            return event.data.content
+        return None
+    finally:
+        record_latency_metric("planner_call", time.perf_counter() - started)
 
 
 async def reconnect_copilot_session(current_client: CopilotClient) -> Tuple[CopilotClient, Any]:
@@ -2555,12 +2851,13 @@ def _calibrate_microphone(recognizer: sr.Recognizer, microphone: sr.Microphone, 
         recognizer.adjust_for_ambient_noise(source, duration=duration)
 
 
-def _capture_audio(recognizer: sr.Recognizer, microphone: sr.Microphone) -> sr.AudioData:
+def _capture_audio(recognizer: sr.Recognizer, microphone: sr.Microphone, phrase_limit: Optional[int] = None) -> sr.AudioData:
     with microphone as source:
+        effective_phrase_limit = phrase_limit if isinstance(phrase_limit, int) and phrase_limit > 0 else PHRASE_TIME_LIMIT
         return recognizer.listen(
             source,
             timeout=LISTEN_TIMEOUT,
-            phrase_time_limit=PHRASE_TIME_LIMIT,
+            phrase_time_limit=effective_phrase_limit,
         )
 
 
@@ -2604,6 +2901,8 @@ async def main() -> None:
         log_line(f"TTS backend: {TTS_BACKEND}")
     else:
         log_line("TTS backend: disabled")
+    log_line("Latency metrics: enabled" if METRICS_ENABLED else "Latency metrics: disabled")
+    log_line(f"STT phrase limits: command={COMMAND_PHRASE_LIMIT}s, dictation={DICTATION_PHRASE_LIMIT}s")
     log_line("Browser mode: headed (always).")
     if SPEAK_STARTUP_STATUS:
         speak_and_wait("Voice Browser starting. Calibrating microphone.")
@@ -2702,7 +3001,8 @@ async def main() -> None:
                     while is_speaking():
                         await asyncio.sleep(0.05)
                 was_speaking_before_listen = is_speaking()
-                audio = await asyncio.to_thread(_capture_audio, recognizer, microphone)
+                listen_limit = DICTATION_PHRASE_LIMIT if state.dictation_mode else COMMAND_PHRASE_LIMIT
+                audio = await asyncio.to_thread(_capture_audio, recognizer, microphone, listen_limit)
                 user_text = (await asyncio.to_thread(transcribe_audio, recognizer, audio)).strip()
                 if BARGE_IN_ENABLED and is_probable_tts_echo(user_text):
                     log_line("  Ignored speaker echo.")
@@ -2847,7 +3147,9 @@ async def main() -> None:
             plan, parse_errors = parse_planner_response(raw_response)
 
             if parse_errors and not plan.actions and not plan.needs_clarification and not plan.quit:
-                fallback_plan = build_click_fallback_plan(user_text, state)
+                fallback_plan = build_text_entry_fallback_plan(user_text, state)
+                if fallback_plan is None:
+                    fallback_plan = build_click_fallback_plan(user_text, state)
                 if fallback_plan is not None:
                     plan = fallback_plan
                     parse_errors = []
