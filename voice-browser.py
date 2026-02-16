@@ -48,6 +48,7 @@ TTS_BACKEND = os.environ.get(
     "VOICE_BROWSER_TTS_BACKEND",
     "pyttsx3",
 ).strip().lower()
+TTS_ENABLED = os.environ.get("VOICE_BROWSER_TTS_ENABLED", "1").strip() != "0"
 STT_BACKEND = os.environ.get("VOICE_BROWSER_STT_BACKEND", "auto").strip().lower()
 STT_DEBUG = os.environ.get("VOICE_BROWSER_STT_DEBUG", "0").strip() == "1"
 LOCAL_STT_MODEL = os.environ.get("VOICE_BROWSER_LOCAL_STT_MODEL", "base.en").strip() or "base.en"
@@ -924,7 +925,17 @@ class BrowserRuntime:
         except Exception:
             pass
         try:
-            page.set_viewport_size({"width": 1920, "height": 1080})
+            page.evaluate(
+                """() => {
+                    try {
+                        window.moveTo(0, 0);
+                        window.resizeTo(screen.availWidth, screen.availHeight);
+                        return true;
+                    } catch {
+                        return false;
+                    }
+                }"""
+            )
         except Exception:
             pass
 
@@ -1133,6 +1144,9 @@ _tts_last_ended_at: float = 0.0
 
 def _init_tts_engine() -> None:
     global _tts_engine
+    if not TTS_ENABLED:
+        _tts_engine = None
+        return
     if TTS_BACKEND in {"windows", "powershell", "system"}:
         _tts_engine = None
         return
@@ -1237,6 +1251,8 @@ def _tts_worker_loop() -> None:
 
 def _start_tts_worker() -> None:
     global _tts_worker_thread
+    if not TTS_ENABLED:
+        return
     if _tts_worker_thread is not None and _tts_worker_thread.is_alive():
         return
     _tts_shutdown_event.clear()
@@ -1245,6 +1261,8 @@ def _start_tts_worker() -> None:
 
 
 def stop_speaking(clear_queue: bool = True) -> None:
+    if not TTS_ENABLED:
+        return
     _tts_stop_event.set()
     with _tts_lock:
         engine = _tts_engine
@@ -1264,6 +1282,8 @@ def stop_speaking(clear_queue: bool = True) -> None:
 
 
 def is_speaking() -> bool:
+    if not TTS_ENABLED:
+        return False
     return _tts_is_speaking.is_set()
 
 
@@ -1305,6 +1325,8 @@ def is_probable_tts_echo(user_text: str) -> bool:
 
 
 def shutdown_tts() -> None:
+    if not TTS_ENABLED:
+        return
     _tts_shutdown_event.set()
     stop_speaking(clear_queue=True)
     _tts_queue.put((None, None))
@@ -1317,6 +1339,8 @@ _start_tts_worker()
 
 
 def speak(text: str, wait: bool = False) -> None:
+    if not TTS_ENABLED:
+        return
     log_line(f"  TTS: {text}")
     _start_tts_worker()
     stop_speaking(clear_queue=True)
@@ -2291,7 +2315,10 @@ async def main() -> None:
         if STT_BACKEND == "faster-whisper":
             log_line("WARN: VOICE_BROWSER_STT_BACKEND=faster-whisper but dependencies are missing; using Google STT.")
         log_line("STT backend: google")
-    log_line(f"TTS backend: {TTS_BACKEND}")
+    if TTS_ENABLED:
+        log_line(f"TTS backend: {TTS_BACKEND}")
+    else:
+        log_line("TTS backend: disabled")
     log_line("Browser mode: headed (always).")
     if SPEAK_STARTUP_STATUS:
         speak_and_wait("Voice Browser starting. Calibrating microphone.")
@@ -2318,6 +2345,10 @@ async def main() -> None:
         if ui:
             ui.set_status("Browser launch failed")
         return
+    try:
+        await asyncio.to_thread(run_ab_ok, ["maximize_window"])
+    except Exception:
+        pass
     if BROWSER.profile_note:
         log_line(BROWSER.profile_note)
         profile_note_lower = BROWSER.profile_note.lower()
